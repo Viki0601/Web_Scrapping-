@@ -1,18 +1,21 @@
 import re
 import json
 import requests
+import time
+import pandas as pd
+import psycopg2
 from bs4 import BeautifulSoup
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
-import psycopg2
-import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
 
 # PostgreSQL database configuration
 db_config = {
     "host": "localhost",
-    "database": "company_details",
+    "database": "Web_Scrapping",
     "user": "postgres",
-    "password": "Vignesh@0601",
+    "password": "Thasneem@postgre",
     "port": 5432
 }
 
@@ -23,48 +26,74 @@ headers = {
 
 # LangChain prompt template
 template = (
-    "Extract the following details from the provided text: {dom_content}. "
-    "Please follow these instructions carefully: \n\n"
-    "1. *Description*: Extract a brief company description. \n"
-    "2. *Products/Services*: List the products or services the company offers. \n"
-    "3. *Use Cases*: Extract use cases where the company's offerings are applied. \n"
-    "4. *Customers*: Identify key customers of the company. \n"
-    "5. *Partners*: Identify the company's partners.\n"
+    "Translate any non-English content to English and extract the following details "
+    "from the provided text: {dom_content}. "
+    "Please follow these instructions carefully:\n\n"
+    "1. If no meaningful content is available or scraping fails, return the string "
+    "'Not able to scrape' for all fields.\n"
+    "2. Description: Extract a brief company description.\n"
+    "3. Products/Services: List the products or services the company offers.\n"
+    "4. Use Cases: Extract use cases where the company's offerings are applied.\n"
+    "5. Customers: Identify key customers of the company.\n"
+    "6. Partners: Identify the company's partners.\n"
     "Provide your output strictly as a JSON object with the keys: "
-    "'description', 'products_services', 'use_cases', 'customers', 'partners'."
+    "'description', 'products_services', 'use_cases', 'customers', 'partners'. "
+    "Ensure all information is strictly in English only."
 )
 
 # Initialize the Ollama LLM model
-model = OllamaLLM(model="llama2")
+model = OllamaLLM(model="llama2", temperature='0.7')
 
-def clean_and_parse_json(response):
-    """Attempt to clean the LLM response and parse it as JSON."""
+# Selenium WebDriver setup
+chrome_options = Options()
+chrome_options.add_argument("--headless")  # Headless mode
+driver = webdriver.Chrome(options=chrome_options)
+
+def get_all_links(url):
+    """Extract all sub-URLs from the given page."""
     try:
-        # Remove any non-JSON text from the response
-        start_index = response.find('{')
-        end_index = response.rfind('}')
-        json_response = response[start_index:end_index + 1]
+        driver.get(url)
+        time.sleep(2)  # Adjust this delay based on page load time
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
 
-        # Attempt to parse the cleaned JSON
-        return json.loads(json_response)
-    except json.JSONDecodeError:
-        print("Error parsing JSON after cleaning.")
-        return fallback_extraction(response)
+        links = set()
+        for a_tag in soup.find_all('a', href=True):
+            link = a_tag['href']
+            if link.startswith('http') or link.startswith('/'):
+                full_url = link if link.startswith('http') else url + link
+                links.add(full_url)
+        return links
+    except Exception as e:
+        print(f"Error extracting links from {url}: {e}")
+        return set()
 
-def scrape_website(url):
-    """Scrape content from the provided URL."""
+def scrape_content(url):
+    """Scrape content from the given URL."""
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(response.text, 'html.parser')
         page_content = soup.get_text(separator=' ').strip()
         return ' '.join(page_content.split())  # Clean extra whitespace
     except requests.exceptions.RequestException as e:
-        print(f"Failed to retrieve the website. Error: {e}")
+        print(f"Failed to retrieve {url}. Error: {e}")
         return ""
+
+def scrape_all_content(start_url):
+    """Scrape the content from all sub-URLs of a given start URL."""
+    all_links = get_all_links(start_url)
+    all_content = ""
+    for link in all_links:
+        print(f"Scraping: {link}")
+        content = scrape_content(link)
+        if content:
+            all_content += content + "\n\n"
+        time.sleep(2)  # Avoid overwhelming the server
+    return all_content
 
 def parse_with_ollama(dom_content):
     """Send content to Ollama LLM and parse the response."""
+    print("Running llama2")
     prompt = ChatPromptTemplate.from_template(template)
     chain = prompt | model
 
@@ -76,15 +105,26 @@ def parse_with_ollama(dom_content):
         with open("raw_responses.log", "a", encoding="utf-8") as log_file:
             log_file.write(response + "\n")
 
-        # Attempt to clean and parse JSON response
         return clean_and_parse_json(response)
     except (json.JSONDecodeError, TypeError):
         print("Failed JSON parsing. Using fallback extraction.")
         return fallback_extraction(response)
 
+def clean_and_parse_json(response):
+    """Attempt to clean the LLM response and parse it as JSON."""
+    try:
+        # Remove any non-JSON text from the response
+        start_index = response.find('{')
+        end_index = response.rfind('}')
+        json_response = response[start_index:end_index + 1]
+
+        return json.loads(json_response)
+    except json.JSONDecodeError:
+        print("Error parsing JSON after cleaning.")
+        return fallback_extraction(response)
 
 def fallback_extraction(text):
-    """Extract fields using regex as a fallback with improved patterns."""
+    """Extract fields using regex as a fallback."""
     patterns = {
         "description": r"(?i)(?:Description\s*:\s*)(.*?)(?:\n|Products/Services|$)",
         "products_services": r"(?i)(?:Products/Services\s*:\s*)(.*?)(?:\n|Use Cases|$)",
@@ -114,7 +154,6 @@ def fetch_urls_from_db():
 
 def save_to_excel(data, filename="extracted_data.xlsx"):
     """Save data to Excel with all fields properly populated."""
-    # Ensure all columns are covered, even if some data is missing.
     row_data = {
         "id": data.get("id", ""),
         "description": data.get("description", ""),
@@ -124,17 +163,14 @@ def save_to_excel(data, filename="extracted_data.xlsx"):
         "partners": data.get("partners", "")
     }
 
-    # Convert the row into a DataFrame
     df = pd.DataFrame([row_data])
 
     try:
-        # If the Excel file exists, load it and append the new row.
         existing_df = pd.read_excel(filename)
         df = pd.concat([existing_df, df], ignore_index=True)
     except FileNotFoundError:
-        pass  # If file doesn't exist, this will create a new one.
+        pass
 
-    # Save the DataFrame to Excel.
     df.to_excel(filename, index=False)
     print(f"Data saved to {filename}")
 
@@ -153,12 +189,18 @@ def update_db(data):
                         partners = %s
                     WHERE id = %s
                 """
+                # **Join list elements into comma-separated strings**
+                customers = ", ".join(data['customers'])
+                partners = ", ".join(data['partners'])
+                products_services = ", ".join(data['products_services'])
+                use_cases = ", ".join(data['use_cases'])
+
                 cursor.execute(query, (
                     data['description'],
-                    data['products_services'],
-                    data['use_cases'],
-                    data['customers'],
-                    data['partners'],
+                    products_services,  # Updated line
+                    use_cases,          # Updated line
+                    customers,          # Updated line
+                    partners,           # Updated line
                     data['id']
                 ))
                 print(f"Updated company ID {data['id']} in the database.")
@@ -168,10 +210,10 @@ def update_db(data):
 def process_company(company_id, company_url):
     """Process a single company: scrape, extract, save, and update."""
     print(f"Processing company ID {company_id} with URL {company_url}")
-    content = scrape_website(company_url)
+    all_content = scrape_all_content(company_url)
 
-    if content:
-        extracted_info = parse_with_ollama(content)
+    if all_content.strip():
+        extracted_info = parse_with_ollama(all_content)
         extracted_info['id'] = company_id
 
         save_to_excel(extracted_info)
@@ -188,10 +230,7 @@ def process_all_companies():
 
     for company_id, company_url in companies:
         process_company(company_id, company_url)
-# Function to remove curly braces from the string fields
-def remove_curly_braces(text):
-    return re.sub(r'[{}]', '', text) if isinstance(text, str) else text
-
 
 if __name__ == "__main__":
     process_all_companies()
+    driver.quit()  # Ensure WebDriver is closed after execution
