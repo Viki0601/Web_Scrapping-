@@ -13,9 +13,9 @@ from selenium.webdriver.chrome.options import Options
 # PostgreSQL database configuration
 db_config = {
     "host": "localhost",
-    "database": "Web_Scrapping",
+    "database": "company_details",
     "user": "postgres",
-    "password": "Thasneem@postgre",
+    "password": "Vignesh@0601",
     "port": 5432
 }
 
@@ -42,7 +42,7 @@ template = (
 )
 
 # Initialize the Ollama LLM model
-model = OllamaLLM(model="llama2", temperature='0.7')
+model = OllamaLLM(model="llama2", temperature='1.5')
 
 # Selenium WebDriver setup
 chrome_options = Options()
@@ -50,10 +50,10 @@ chrome_options.add_argument("--headless")  # Headless mode
 driver = webdriver.Chrome(options=chrome_options)
 
 def get_all_links(url):
-    """Extract all sub-URLs from the given page."""
+    """Extract all sub-URLs from the given page, excluding LinkedIn links."""
     try:
         driver.get(url)
-        time.sleep(2)  # Adjust this delay based on page load time
+        time.sleep(2)
         soup = BeautifulSoup(driver.page_source, 'html.parser')
 
         links = set()
@@ -61,11 +61,14 @@ def get_all_links(url):
             link = a_tag['href']
             if link.startswith('http') or link.startswith('/'):
                 full_url = link if link.startswith('http') else url + link
-                links.add(full_url)
+                # Exclude LinkedIn URLs
+                if "linkedin.com" not in full_url:
+                    links.add(full_url)
         return links
     except Exception as e:
         print(f"Error extracting links from {url}: {e}")
         return set()
+
 
 def scrape_content(url):
     """Scrape content from the given URL."""
@@ -74,7 +77,7 @@ def scrape_content(url):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         page_content = soup.get_text(separator=' ').strip()
-        return ' '.join(page_content.split())  # Clean extra whitespace
+        return ' '.join(page_content.split())
     except requests.exceptions.RequestException as e:
         print(f"Failed to retrieve {url}. Error: {e}")
         return ""
@@ -88,7 +91,7 @@ def scrape_all_content(start_url):
         content = scrape_content(link)
         if content:
             all_content += content + "\n\n"
-        time.sleep(2)  # Avoid overwhelming the server
+        time.sleep(2)
     return all_content
 
 def parse_with_ollama(dom_content):
@@ -101,19 +104,25 @@ def parse_with_ollama(dom_content):
         response = chain.invoke({"dom_content": dom_content})
         print("Raw response:", response)
 
-        # Logging the raw response for debugging purposes, using utf-8 encoding
         with open("raw_responses.log", "a", encoding="utf-8") as log_file:
             log_file.write(response + "\n")
 
-        return clean_and_parse_json(response)
-    except (json.JSONDecodeError, TypeError):
-        print("Failed JSON parsing. Using fallback extraction.")
-        return fallback_extraction(response)
+        json_response = clean_and_parse_json(response)
+        
+        # If the JSON response is empty or has invalid content, handle gracefully
+        if not json_response:
+            print("Received empty or invalid JSON response. Using fallback.")
+            return fallback_extraction(response)
+        
+        return json_response
+    except Exception as e:
+        print(f"Error during LLM processing: {e}")
+        return {"description": "Not able to scrape", "products_services": "", "use_cases": "", "customers": "", "partners": ""}
+
 
 def clean_and_parse_json(response):
     """Attempt to clean the LLM response and parse it as JSON."""
     try:
-        # Remove any non-JSON text from the response
         start_index = response.find('{')
         end_index = response.rfind('}')
         json_response = response[start_index:end_index + 1]
@@ -137,7 +146,6 @@ def fallback_extraction(text):
     for key, pattern in patterns.items():
         match = re.search(pattern, text, re.DOTALL)
         extracted_info[key] = match.group(1).strip() if match else ""
-
     return extracted_info
 
 def fetch_urls_from_db():
@@ -174,6 +182,14 @@ def save_to_excel(data, filename="extracted_data.xlsx"):
     df.to_excel(filename, index=False)
     print(f"Data saved to {filename}")
 
+def flatten_field(field):
+    """Flatten field data to handle nested dictionaries or lists."""
+    if isinstance(field, list):
+        return [str(item) if not isinstance(item, dict) else json.dumps(item) for item in field]
+    elif isinstance(field, dict):
+        return [json.dumps(field)]
+    return [str(field)]
+
 def update_db(data):
     """Update the database with extracted data."""
     try:
@@ -189,18 +205,19 @@ def update_db(data):
                         partners = %s
                     WHERE id = %s
                 """
-                # **Join list elements into comma-separated strings**
-                customers = ", ".join(data['customers'])
-                partners = ", ".join(data['partners'])
-                products_services = ", ".join(data['products_services'])
-                use_cases = ", ".join(data['use_cases'])
+                
+                # Flatten fields to avoid type errors
+                customers = ", ".join(flatten_field(data.get('customers', "")))
+                partners = ", ".join(flatten_field(data.get('partners', "")))
+                products_services = ", ".join(flatten_field(data.get('products_services', "")))
+                use_cases = ", ".join(flatten_field(data.get('use_cases', "")))
 
                 cursor.execute(query, (
-                    data['description'],
-                    products_services,  # Updated line
-                    use_cases,          # Updated line
-                    customers,          # Updated line
-                    partners,           # Updated line
+                    data.get('description', ""),
+                    products_services,
+                    use_cases,
+                    customers,
+                    partners,
                     data['id']
                 ))
                 print(f"Updated company ID {data['id']} in the database.")
@@ -234,3 +251,4 @@ def process_all_companies():
 if __name__ == "__main__":
     process_all_companies()
     driver.quit()  # Ensure WebDriver is closed after execution
+    
